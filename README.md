@@ -92,4 +92,8 @@ Double-click:
 Launch_Service_Repair.bat
 ```
 
-The scripts have been source-reviewed for Windows PowerShell 5.1 but have not been runtime-tested against every service, dependency chain or vendor agent.
+## Validation status
+
+Tested successfully by the author on his own Windows machines. The documented service inventory, dependency, startup-type and guarded repair workflows worked as intended on those systems.
+
+Results may vary with the Windows build, service account, dependency chain, permissions, endpoint security controls, vendor agent, recovery configuration and application-specific service behaviour. Use `-DryRun` and confirm the vendor's expected service configuration before applying changes on a new machine.

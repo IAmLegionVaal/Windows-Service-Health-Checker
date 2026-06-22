@@ -27,7 +27,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.0.1'
 $Stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $ExitCode = 0
 
@@ -93,6 +93,12 @@ function Get-SelectedService {
     return $service
 }
 
+function Get-SelectedServiceCim {
+    if ([string]::IsNullOrWhiteSpace($ServiceName)) { return $null }
+    $escapedName = $ServiceName.Replace("'", "''")
+    return Get-CimInstance Win32_Service -Filter "Name='$escapedName'" -ErrorAction SilentlyContinue
+}
+
 function Assert-ServiceCanBeChanged {
     param([Parameter(Mandatory)][string]$Name)
     if ($ProtectedServices -contains $Name) {
@@ -103,11 +109,7 @@ function Assert-ServiceCanBeChanged {
 function Save-State {
     param([Parameter(Mandatory)][string]$Stage)
 
-    $selected = $null
-    if (-not [string]::IsNullOrWhiteSpace($ServiceName)) {
-        $selected = Get-CimInstance Win32_Service -Filter "Name='$($ServiceName.Replace("'", "''"))'" -ErrorAction SilentlyContinue
-    }
-
+    $selected = Get-SelectedServiceCim
     $state = [ordered]@{
         Stage = $Stage
         Generated = (Get-Date).ToString('o')
@@ -134,7 +136,7 @@ function Save-State {
 
 function Save-ServiceBackup {
     if ([string]::IsNullOrWhiteSpace($ServiceName)) { return }
-    $service = Get-CimInstance Win32_Service -Filter "Name='$($ServiceName.Replace("'", "''"))'" -ErrorAction SilentlyContinue
+    $service = Get-SelectedServiceCim
     if (-not $service) { return }
 
     $service | Export-Clixml -LiteralPath (Join-Path $BackupPath 'service-before.clixml')
@@ -161,6 +163,7 @@ function Start-ServiceDependenciesRecursive {
                 Write-Log "Would start dependency '$($current.Name)'." 'DRYRUN'
             } else {
                 Start-Service -Name $current.Name -ErrorAction Stop
+                (Get-Service -Name $current.Name).WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
                 Write-Log "Started dependency '$($current.Name)'." 'SUCCESS'
             }
         }
@@ -196,7 +199,8 @@ function Invoke-StopSelectedService {
     Require-Administrator
     $service = Get-SelectedService
     Assert-ServiceCanBeChanged -Name $service.Name
-    if ($service.DependentServices | Where-Object Status -eq 'Running') {
+    $runningDependents = @($service.DependentServices | Where-Object { $_.Status -eq 'Running' })
+    if ($runningDependents.Count -gt 0) {
         throw "Service '$ServiceName' has running dependent services. Stop them using an approved service-specific procedure."
     }
     if (-not (Confirm-Action "Stop service '$ServiceName'? Applications may be interrupted." -HighImpact)) { throw 'User cancelled.' }
@@ -255,16 +259,32 @@ function Invoke-SetStartupType {
         'Manual' { Set-Service -Name $service.Name -StartupType Manual }
         'Disabled' { Set-Service -Name $service.Name -StartupType Disabled }
     }
-    Write-Log "Startup type for '$ServiceName' changed to '$SetStartupType'." 'SUCCESS'
+
+    $after = Get-SelectedServiceCim
+    if (-not $after) { throw 'Could not verify the service after changing startup type.' }
+    switch ($SetStartupType) {
+        'Automatic' {
+            if ($after.StartMode -ne 'Auto') { throw 'Startup type verification failed.' }
+            $delayed = (Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$($service.Name)" -Name DelayedAutoStart -ErrorAction SilentlyContinue).DelayedAutoStart
+            if ($delayed -eq 1) { throw 'Service remained configured for delayed automatic startup.' }
+        }
+        'AutomaticDelayedStart' {
+            $delayed = (Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$($service.Name)" -Name DelayedAutoStart -ErrorAction SilentlyContinue).DelayedAutoStart
+            if ($after.StartMode -ne 'Auto' -or $delayed -ne 1) { throw 'Delayed automatic startup verification failed.' }
+        }
+        'Manual' { if ($after.StartMode -ne 'Manual') { throw 'Startup type verification failed.' } }
+        'Disabled' { if ($after.StartMode -ne 'Disabled') { throw 'Startup type verification failed.' } }
+    }
+    Write-Log "Startup type for '$ServiceName' changed to '$SetStartupType' and verified." 'SUCCESS'
 }
 
 function Invoke-TerminateStuckProcess {
     Require-Administrator
     $service = Get-SelectedService
     Assert-ServiceCanBeChanged -Name $service.Name
-    $cim = Get-CimInstance Win32_Service -Filter "Name='$($service.Name.Replace("'", "''"))'" -ErrorAction Stop
+    $cim = Get-SelectedServiceCim
 
-    if ($cim.State -notmatch 'Pending') {
+    if (-not $cim -or $cim.State -notmatch 'Pending') {
         throw "Service '$ServiceName' is not in a pending state. Process termination is refused."
     }
     if ([int]$cim.ProcessId -le 4) {
@@ -273,7 +293,7 @@ function Invoke-TerminateStuckProcess {
 
     $sharing = @(Get-CimInstance Win32_Service -Filter "ProcessId=$($cim.ProcessId)" -ErrorAction SilentlyContinue)
     $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($cim.ProcessId)" -ErrorAction Stop
-    $exeName = [IO.Path]::GetFileName($process.ExecutablePath)
+    $exeName = [IO.Path]::GetFileName([string]$process.ExecutablePath)
     if ($sharing.Count -gt 1 -or $exeName -ieq 'svchost.exe') {
         throw "Process $($cim.ProcessId) is shared by multiple services or hosted by svchost.exe. Termination is refused."
     }
@@ -284,9 +304,13 @@ function Invoke-TerminateStuckProcess {
         return
     }
 
-    Stop-Process -Id $cim.ProcessId -Force -ErrorAction Stop
+    $processId = [int]$cim.ProcessId
+    Stop-Process -Id $processId -Force -ErrorAction Stop
     Start-Sleep -Seconds 2
-    Write-Log "Terminated stuck dedicated process $($cim.ProcessId) for '$ServiceName'." 'SUCCESS'
+    if (Get-Process -Id $processId -ErrorAction SilentlyContinue) {
+        throw "Process $processId remained active after termination was requested."
+    }
+    Write-Log "Terminated stuck dedicated process $processId for '$ServiceName' and verified its exit." 'SUCCESS'
 }
 
 function Invoke-SafeRepairSet {
